@@ -1,18 +1,9 @@
 const { calculateProfit, toDecimal, storeItInTempAsJSON } = require("../utils");
 const cache = require("./cache");
-const { setTimeout } = require("timers/promises");
 const { balanceCheck } = require("./setup");
-const { checktrans } = require("../utils/transaction.js");
+const fetch = require("cross-fetch");
+const { Connection, VersionedTransaction, PublicKey } = require("@solana/web3.js");
 const promiseRetry = require("promise-retry");
-
-const waitabit = async (ms) => {
-    const mySecondPromise = new Promise(function(resolve, reject) {
-        console.log('Constructing a promise...');
-        setTimeout(() => {
-            reject(console.log('Error in promise'));
-        }, ms);
-    });
-};
 
 const swap = async (jupiter, route, wallet) => {
     try {
@@ -21,25 +12,43 @@ const swap = async (jupiter, route, wallet) => {
 
         if (process.env.DEBUG) storeItInTempAsJSON("routeInfoBeforeSwap", route);
 
-        const priority = typeof cache.config.priority === "number" ? cache.config.priority : 100; // Default 100 BPS
-        cache.priority = priority;
-
-        const txId = await jupiter.executeTransaction({
-            route,
-            wallet,
+        console.log("Preparing swap transaction...");
+        const swapResponse = await fetch("https://quote-api.jup.ag/v6/swap", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                routeInfo: route,
+                userPublicKey: wallet.publicKey.toString(),
+            }),
         });
 
-        if (process.env.DEBUG) storeItInTempAsJSON("transactionResult", { txId });
+        const swapData = await swapResponse.json();
 
-        // Reset counter on success
-        cache.tradeCounter.failedbalancecheck = 0;
-        cache.tradeCounter.errorcount = 0;
+        if (!swapData || !swapData.swapTransaction) {
+            throw new Error("Failed to prepare swap transaction.");
+        }
+
+        // Deserialize the transaction
+        const swapTransactionBuf = Buffer.from(swapData.swapTransaction, "base64");
+        const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
+
+        // Sign and send the transaction
+        transaction.sign([wallet]);
+        const connection = new Connection(cache.config.rpc[0], "confirmed");
+        const txId = await connection.sendRawTransaction(transaction.serialize(), { skipPreflight: true });
+
+        console.log(`Swap transaction sent. Transaction ID: ${txId}`);
+
+        // Confirm the transaction
+        await connection.confirmTransaction(txId, "confirmed");
+        console.log("Swap transaction confirmed.");
 
         const performanceOfTx = performance.now() - performanceOfTxStart;
 
         return [txId, performanceOfTx];
     } catch (error) {
-        console.log("Swap error: ", error);
+        console.error("Swap error: ", error.message);
+        throw error;
     }
 };
 exports.swap = swap;
@@ -66,7 +75,7 @@ const failedSwapHandler = async (tradeEntry, inputToken, tradeAmount) => {
     cache.tradeCounter.errorcount++;
     if (cache.tradeCounter.errorcount > 100) {
         console.log(`Error count too high for swaps: ${cache.tradeCounter.errorcount}`);
-        console.log('Ending to stop endless transaction failures');
+        console.log("Ending to stop endless transaction failures");
         process.exit();
     }
 };
